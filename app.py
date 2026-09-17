@@ -245,13 +245,11 @@ def parse_log_content(lines, image_keys, log_type="all", context_line_count=40):
                 is_ocr = False
             else:
                 is_iv2 = bool(
-                    re.search(r'(led|display|backlight|lvds|brightness|color)', summary_text, re.IGNORECASE) or 
-                    re.search(r'(led|display|backlight)', detected_task, re.IGNORECASE) or
-                    last_measurement is not None
+                    re.search(r'(_led|_display|led_|display_|backlight|lvds|brightness|color)', summary_text, re.IGNORECASE) or
+                    re.search(r'(_led|_display|_backlight|led_|display_|backlight_)', detected_task, re.IGNORECASE)# or last_measurement is not None
                 )
-                is_ocr = bool(is_iv2 or len(recent_images_queue) > 0 or last_ux_action or 
-                              re.search(r'(ocr|vision|eichrecht|verify_.*_status)', summary_text, re.IGNORECASE))
-
+                is_ocr = bool(is_iv2 or len(recent_images_queue) > 0 or last_ux_action or
+                              re.search(r'(_ocr|_vision|ocr_|vision_|eichrecht|verify_.*_status)', summary_text, re.IGNORECASE))
             prior_context = list(recent_history_buffer)
             captured_images = list(recent_images_queue) if not is_explicit_general else []
 
