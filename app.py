@@ -17,28 +17,20 @@ st.set_page_config(
 # 1. 압축 파일 및 이미지 추출 헬퍼 함수
 # ==========================================
 def extract_contents_from_archive(uploaded_file):
-    """
-    업로드된 파일에서:
-    1) 'task_sequence_log.log' 텍스트 라인 추출
-    2) vision_image_data_part_#.* 압축파일을 포함한 모든 이미지 파일(.jpg, .jpeg, .png)을
-       {파일명: 바이너리_데이터} 딕셔너리로 메모리에 수집
-    """
     file_name = uploaded_file.name.lower()
     file_bytes = uploaded_file.read()
 
     log_lines = None
     log_source_name = None
-    image_dict = {}  # { "image_filename.jpg": bytes_data }
+    image_dict = {}
 
     def process_inner_archive(archive_name, inner_bytes):
-        """내부 중첩 압축 파일(vision_image_data_part_... 등) 재귀 해제"""
         name_lower = archive_name.lower()
         if name_lower.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(inner_bytes)) as iz:
                     for f in iz.namelist():
-                        f_lower = f.lower()
-                        if f_lower.endswith((".jpg", ".jpeg", ".png")):
+                        if f.lower().endswith((".jpg", ".jpeg", ".png")):
                             image_dict[Path(f).name] = iz.read(f)
             except Exception:
                 pass
@@ -53,62 +45,49 @@ def extract_contents_from_archive(uploaded_file):
             except Exception:
                 pass
 
-    # 1) ZIP 압축 파일 처리
+    # 1) ZIP 처리
     if file_name.endswith(".zip"):
         try:
             with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-                all_files = z.namelist()
-                for name in all_files:
+                for name in z.namelist():
                     name_lower = name.lower()
-                    
-                    # 로그 파일 탐색
                     if Path(name).name.lower() == "task_sequence_log.log":
                         with z.open(name) as lf:
                             log_lines = lf.read().decode('utf-8', errors='ignore').splitlines()
                             log_source_name = name
-
-                    # 중첩 압축 파일 (vision_image_data_part_* 등) 탐색 및 2차 해제
                     elif re.search(r'vision_image_data_part_.*?\.(zip|tar|tar\.gz|tgz)', Path(name).name, re.IGNORECASE):
                         inner_data = z.read(name)
                         process_inner_archive(name, inner_data)
-
-                    # 루트/서브폴더에 바로 풀려있는 이미지 수집
                     elif name_lower.endswith((".jpg", ".jpeg", ".png")):
                         image_dict[Path(name).name] = z.read(name)
-
         except Exception as e:
             return None, {}, f"ZIP 처리 중 오류: {e}"
 
-    # 2) TAR / TAR.GZ 압축 파일 처리
+    # 2) TAR / TAR.GZ 처리
     elif file_name.endswith((".tar", ".tar.gz", ".tgz")):
         try:
             with tarfile.open(fileobj=io.BytesIO(file_bytes)) as t:
-                members = t.getmembers()
-                for m in members:
+                for m in t.getmembers():
                     if not m.isfile():
                         continue
                     m_lower = m.name.lower()
-
                     if Path(m.name).name.lower() == "task_sequence_log.log":
                         f = t.extractfile(m)
                         if f:
                             log_lines = f.read().decode('utf-8', errors='ignore').splitlines()
                             log_source_name = m.name
-
                     elif re.search(r'vision_image_data_part_.*?\.(zip|tar|tar\.gz|tgz)', Path(m.name).name, re.IGNORECASE):
                         f = t.extractfile(m)
                         if f:
                             process_inner_archive(m.name, f.read())
-
                     elif m_lower.endswith((".jpg", ".jpeg", ".png")):
                         f = t.extractfile(m)
                         if f:
                             image_dict[Path(m.name).name] = f.read()
-
         except Exception as e:
             return None, {}, f"TAR 처리 중 오류: {e}"
 
-    # 3) 단일 로그 파일 (.log, .txt)
+    # 3) 단일 로그 파일
     else:
         log_lines = file_bytes.decode('utf-8', errors='ignore').splitlines()
         log_source_name = uploaded_file.name
@@ -121,7 +100,7 @@ def extract_contents_from_archive(uploaded_file):
 
 
 # ==========================================
-# 2. 코어 파싱 로직
+# 2. 코어 파싱 로직 (중요 연계 이미지 최대 2장 보관)
 # ==========================================
 def parse_log_content(lines, log_type="all", context_line_count=40):
     barcode_pattern = re.compile(r'ScanBarcode\s*:\s*([^,\s]+)\s*,\s*([^\s,]+)', re.IGNORECASE)
@@ -132,16 +111,18 @@ def parse_log_content(lines, log_type="all", context_line_count=40):
     next_log_pattern = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\s+[A-Z]+\[\d+\]:')
     target_msg_pattern = re.compile(r'(?:[A-Za-z0-9_.]*(?:Failure|Error))\s*:\s*(.*)', re.IGNORECASE)
     ux_action_pattern = re.compile(r'UX Action Verify:(.*)')
+    
     ocr_image_pattern = re.compile(r'OCR image\[(?P<full_path>.*?/(?P<filename>[^/]+))\]\s+save complete\.', re.IGNORECASE)
+    ftp_download_pattern = re.compile(r"FTP server\s+['\"][^'\"]+['\"]\s+file download\s+['\"](?P<full_path>.*?/(?P<filename>[^/'\"]+))['\"]\s+completed\.", re.IGNORECASE)
 
     results = []
     current_sn = "N/A"
     current_pn = "N/A"
     last_ux_action = None
-    last_ocr_path = None
-    last_ocr_filename = None
     recent_ocr_flag = False
 
+    # 에러 직전 발생한 최근 이미지 최대 2개만 유지하는 큐
+    recent_images_queue = deque(maxlen=2)
     recent_history_buffer = deque(maxlen=context_line_count)
 
     in_error_block = False
@@ -150,49 +131,64 @@ def parse_log_content(lines, log_type="all", context_line_count=40):
     for line_no, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
 
-        # 1. Barcode
+        # 1. Barcode 추적
         b_match = barcode_pattern.search(line)
         if b_match:
             current_sn = b_match.group(1).strip()
             current_pn = b_match.group(2).strip()
 
-        # 2. OCR Image
+        # 2. OCR Image 패턴
         img_match = ocr_image_pattern.search(line)
         if img_match:
             p = Path(img_match.group("full_path"))
-            last_ocr_path = str(p.parent) + "/"
-            last_ocr_filename = p.name
+            # 중복 등록 방지 후 큐 추가 (최대 2개 유지)
+            if not any(item["filename"] == p.name for item in recent_images_queue):
+                recent_images_queue.append({
+                    "path": str(p.parent) + "/",
+                    "filename": p.name
+                })
             recent_ocr_flag = True
 
-        # 3. UX Action
+        # 3. FTP Download 패턴
+        ftp_match = ftp_download_pattern.search(line)
+        if ftp_match:
+            p = Path(ftp_match.group("full_path"))
+            if not any(item["filename"] == p.name for item in recent_images_queue):
+                recent_images_queue.append({
+                    "path": str(p.parent) + "/",
+                    "filename": p.name
+                })
+            recent_ocr_flag = True
+
+        # 4. UX Action 추적
         ux_match = ux_action_pattern.search(line)
         if ux_match:
             last_ux_action = ux_match.group(0).strip()
             recent_ocr_flag = True
 
-        # 4. ERROR Header
+        # 5. ERROR/EER 헤더 감지
         h_match = error_header_pattern.match(line)
         if h_match:
             in_error_block = True
             summary_text = h_match.group("summary")
-            is_ocr = bool(recent_ocr_flag or re.search(r'(ocr|display|led|eichrecht|screen|verify_.*_status)', summary_text, re.IGNORECASE))
+            is_ocr = bool(recent_ocr_flag or len(recent_images_queue) > 0 or re.search(r'(ocr|vision|display|led|eichrecht|screen|verify_.*_status)', summary_text, re.IGNORECASE))
             
             prior_context = list(recent_history_buffer)
+
+            # 직전 중요 이미지 최대 2개 복사 (최신 이미지가 뒤에 위치)
+            captured_images = list(recent_images_queue)
 
             current_error_info = {
                 "line_no": line_no,
                 "timestamp": h_match.group("timestamp"),
                 "is_ocr_error": is_ocr,
-                "category": "OCR 검증 에러" if is_ocr else "일반 DUT 에러",
+                "category": "Vision/OCR 검증 에러" if is_ocr else "일반 DUT 에러",
                 "summary": summary_text,
                 "sn": current_sn,
                 "pn": current_pn,
                 "prior_logs": prior_context,
-                "ocr_info": {
-                    "image_path": last_ocr_path if is_ocr else None,
-                    "image_file": last_ocr_filename if is_ocr else None,
-                    "ux_action": last_ux_action if is_ocr else None
-                },
+                "linked_images": captured_images,  # 최대 2개 이미지
+                "ux_action": last_ux_action if is_ocr else None,
                 "traceback": [],
                 "root_errors": []
             }
@@ -205,11 +201,11 @@ def parse_log_content(lines, log_type="all", context_line_count=40):
             recent_ocr_flag = False
             continue
 
-        # 5. End of Error Block
+        # 6. 에러 블록 종료
         if in_error_block and next_log_pattern.match(line):
             in_error_block = False
 
-        # 6. Inside Error Block
+        # 7. 에러 블록 내부 내용 수집
         if in_error_block:
             if line:
                 current_error_info["traceback"].append(raw_line.rstrip())
@@ -234,10 +230,10 @@ def parse_log_content(lines, log_type="all", context_line_count=40):
 
 
 # ==========================================
-# 3. 웹 UI 구성 및 이미지 표시
+# 3. 웹 UI 구성 및 연계 이미지 (최대 2개) Display
 # ==========================================
 st.title("🛠️ DUT 테스트 로그 & Vision 이미지 분석 시스템")
-st.caption("압축 해제 | task_sequence_log.log 파싱 | vision_image_data_part_#.### 내부 이미지 매핑 및 Display")
+st.caption("에러 연계 주요 이미지(최대 2장) 비교 | task_sequence_log.log 파싱 | 직전 Context 40줄")
 
 uploaded_file = st.file_uploader(
     "로그 및 Vision 이미지 압축파일(.zip, .tar.gz)을 업로드하세요",
@@ -252,12 +248,11 @@ if uploaded_file:
     else:
         st.success(f"✅ {status_msg}")
 
-        # 상단 필터 & 슬라이더
         col_filter, col_lines = st.columns([2, 1])
         with col_filter:
             view_mode = st.radio(
                 "보고 싶은 로그 유형 선택:",
-                ["전체 (All)", "OCR 검증 로그 (OCR Only)", "일반 시퀀스 로그 (General Only)"],
+                ["전체 (All)", "Vision/OCR 검증 로그 (OCR Only)", "일반 시퀀스 로그 (General Only)"],
                 horizontal=True
             )
         with col_lines:
@@ -265,7 +260,7 @@ if uploaded_file:
 
         mode_map = {
             "전체 (All)": "all",
-            "OCR 검증 로그 (OCR Only)": "ocr",
+            "Vision/OCR 검증 로그 (OCR Only)": "ocr",
             "일반 시퀀스 로그 (General Only)": "general"
         }
         
@@ -275,25 +270,23 @@ if uploaded_file:
             context_line_count=context_count
         )
 
-        # 통계 메트릭
         ocr_count = sum(1 for r in all_results if r["is_ocr_error"])
         gen_count = len(all_results) - ocr_count
         
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("총 에러 감지", f"{len(all_results)} 건")
-        m2.metric("OCR 관련 에러", f"{ocr_count} 건")
+        m2.metric("Vision/OCR 에러", f"{ocr_count} 건")
         m3.metric("일반 시퀀스 에러", f"{gen_count} 건")
         m4.metric("로드된 Vision 이미지", f"{len(image_cache)} 장")
 
         st.divider()
 
-        # 에러 목록 렌더링
         if not filtered_results:
             st.info("선택한 필터 조건에 해당하는 에러가 없습니다. (테스트 PASS)")
         else:
             for idx, item in enumerate(filtered_results, 1):
                 badge_color = "🔴" if item["is_ocr_error"] else "🔵"
-                target_img_name = item["ocr_info"]["image_file"]
+                linked_imgs = item["linked_images"]  # 최대 2개
 
                 with st.expander(
                     f"{badge_color} [{idx}] Line {item['line_no']} | {item['category']} | SN: {item['sn']} (PN: {item['pn']})", 
@@ -301,42 +294,46 @@ if uploaded_file:
                 ):
                     st.markdown(f"**Task / Error 요약:** `{item['summary']}`")
 
-                    # 핵심 에러 원인 표시
+                    # 핵심 에러 원인
                     if item["root_errors"]:
                         st.error(f"**Root Failure / Error:**\n" + "\n".join([f"- {e}" for e in item["root_errors"]]))
 
-                    # OCR 에러인 경우 이미지 및 검증 데이터 Display
+                    # Vision / OCR 에러 시 연계 이미지 최대 2장 Display
                     if item["is_ocr_error"]:
-                        st.markdown("#### 📷 OCR 검증 메타데이터 & 캡처 이미지")
-                        col_meta, col_img = st.columns([1, 1])
+                        st.markdown("#### 📷 Vision / OCR 연계 이미지 (최대 2장)")
+                        
+                        if item["ux_action"]:
+                            st.info(f"**UX Action Verify:** `{item['ux_action']}`")
 
-                        with col_meta:
-                            st.info(f"""
-                            - **저장 경로**: `{item['ocr_info']['image_path'] or 'N/A'}`
-                            - **타겟 파일명**: `{target_img_name or 'N/A'}`
-                            - **UX Action**: `{item['ocr_info']['ux_action'] or 'N/A'}`
-                            """)
+                        if linked_imgs:
+                            # 1장이면 col 1개, 2장이면 col 2개 균등 분할
+                            cols = st.columns(len(linked_imgs))
+                            for c_idx, img_info in enumerate(linked_imgs):
+                                with cols[c_idx]:
+                                    tag = "최근 1순위 (실패 직전)" if c_idx == len(linked_imgs) - 1 else "최근 2순위 (이전 스텝)"
+                                    st.markdown(f"**[{tag}]**")
+                                    st.caption(f"파일명: `{img_info['filename']}`")
+                                    st.caption(f"경로: `{img_info['path']}`")
 
-                        with col_img:
-                            if target_img_name and target_img_name in image_cache:
-                                img_bytes = image_cache[target_img_name]
-                                st.image(
-                                    img_bytes, 
-                                    caption=f"실패 대상 이미지: {target_img_name}", 
-                                    use_container_width=True
-                                )
-                                # 개별 이미지 다운로드 버튼
-                                st.download_button(
-                                    label="💾 이미지 원본 다운로드",
-                                    data=img_bytes,
-                                    file_name=target_img_name,
-                                    mime="image/jpeg",
-                                    key=f"dl_img_{idx}"
-                                )
-                            elif target_img_name:
-                                st.warning(f"⚠️ `{target_img_name}` 파일이 압축파일(`vision_image_data_part_*`) 내에 포함되어 있지 않습니다.")
-                            else:
-                                st.write("연결된 이미지 파일 정보가 없습니다.")
+                                    fname = img_info['filename']
+                                    if fname in image_cache:
+                                        img_bytes = image_cache[fname]
+                                        st.image(
+                                            img_bytes, 
+                                            caption=fname, 
+                                            use_container_width=True
+                                        )
+                                        st.download_button(
+                                            label=f"💾 {fname} 다운로드",
+                                            data=img_bytes,
+                                            file_name=fname,
+                                            mime="image/jpeg",
+                                            key=f"dl_{idx}_{c_idx}"
+                                        )
+                                    else:
+                                        st.warning(f"⚠️ 압축 내 `{fname}` 바이너리 파일 없음")
+                        else:
+                            st.write("연계된 이미지 파일 정보가 없습니다.")
 
                     # 탭 분리: 직전 N줄 로그 vs Traceback
                     tab1, tab2 = st.tabs([f"📋 에러 직전 로그 ({len(item['prior_logs'])} 라인)", "🔍 Traceback 전체 스택"])
